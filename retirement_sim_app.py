@@ -445,7 +445,7 @@ with st.sidebar:
     )
     withdrawal_pct = st.slider(
         "Annual withdrawal rate (% of current balance)",
-        min_value=3.0, max_value=6.0, value=4.0, step=0.1,
+        min_value=3.0, max_value=10.0, value=4.0, step=0.1,
     )
     initial_age = st.slider(
         "Age at first withdrawal",
