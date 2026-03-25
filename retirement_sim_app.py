@@ -202,6 +202,50 @@ def get_stress_params(base_annual_rate, pos_weight, in_stress, sor_severity):
     weight_shift = sor_severity * (pos_weight / 5.0)
     return base_annual_rate - suppression, max(0.0, pos_weight - weight_shift)
 
+def generate_stress_calendar(years, mean_interval, rng):
+    """
+    Returns a dict of {year: severity} for stress events.
+    Uses Poisson process — events arrive randomly with
+    average spacing of mean_interval years.
+    """
+    stress_years = {}
+    yr = 0
+    while yr < years:
+        # Time to next event is exponentially distributed
+        gap = rng.exponential(mean_interval)
+        yr += int(np.round(gap))
+        if yr >= years:
+            break
+        # Severity weighted toward lower values (mild more common)
+        severity = rng.choice([1,2,3,4,5], p=[0.35, 0.30, 0.20, 0.10, 0.05])
+        duration = rng.choice([1, 2, 3],   p=[0.50, 0.35, 0.15])
+        for d in range(duration):
+            if yr + d < years:
+                # Take max if overlapping events
+                stress_years[yr + d] = max(
+                    stress_years.get(yr + d, 0), severity
+                )
+    return stress_years
+def _generate_stress_calendar_weighted(years, mean_interval, severity_probs, rng):
+    """
+    Same as generate_stress_calendar but accepts a pre-built
+    severity probability array, allowing skew control.
+    """
+    stress_calendar = {}
+    yr = 0
+    while yr < years:
+        gap = max(1, int(np.round(rng.exponential(mean_interval))))
+        yr += gap
+        if yr >= years:
+            break
+        severity = int(rng.choice([1, 2, 3, 4, 5], p=severity_probs))
+        duration = int(rng.choice([1, 2, 3], p=[0.50, 0.35, 0.15]))
+        for d in range(duration):
+            if yr + d < years:
+                stress_calendar[yr + d] = max(
+                    stress_calendar.get(yr + d, 0), severity
+                )
+    return stress_calendar
 # ══════════════════════════════════════════════════════════════════════════════
 # Core simulation
 # ══════════════════════════════════════════════════════════════════════════════
@@ -213,12 +257,25 @@ def run_simulation(
     sor_enabled=False, sor_severity=2, sor_start_yr=1, sor_duration=2,
     dither_model='bimodal',
     tld_alpha=1.5, tld_cutoff=0.65, tld_neg_weight=0.65,
+    stoch_enabled=False,                  # ← new
+    stoch_mean_interval=7,                # ← new
+    stoch_severity_skew=0.5,              # ← new
 ):
     base_monthly_rate = base_annual_rate / 12
 
-    def in_stress_window(yr):
+    def in_stress_window(yr, stress_calendar=None):
+        if stoch_enabled and stress_calendar is not None:
+            return yr in stress_calendar
         return (sor_enabled
                 and sor_start_yr - 1 <= yr < sor_start_yr - 1 + sor_duration)
+    
+    def get_severity_for_year(yr, stress_calendar=None):
+        """Returns severity for the year — 0 if not a stress year."""
+        if stoch_enabled and stress_calendar is not None:
+            return stress_calendar.get(yr, 0)
+        if sor_enabled and sor_start_yr - 1 <= yr < sor_start_yr - 1 + sor_duration:
+            return sor_severity
+        return 0
 
     def get_yr_params(yr):
         """Returns (annual_rate, effective_pos_weight) for a given year."""
@@ -246,8 +303,12 @@ def run_simulation(
     bal         = float(principal)
 
     for yr in range(years):
-        age              = initial_age + yr
-        yr_rate, _       = get_yr_params(yr)
+        age = initial_age + yr
+        yr_severity = get_severity_for_year(yr, stress_calendar=None)
+        in_stress   = yr_severity > 0
+        yr_rate, _ = get_stress_params(
+            base_annual_rate, pos_weight, in_stress, yr_severity
+        )
         monthly_rate     = yr_rate / 12
         rmd_annual       = get_rmd(bal, age)
         voluntary_annual = bal * withdrawal_rate
@@ -263,22 +324,40 @@ def run_simulation(
     rmd_binding     = np.zeros((n_sims, years), dtype=bool)
 
     for s in range(n_sims):
-        rng            = np.random.default_rng(base_seed + s)
-        bal            = float(principal)
+        rng = np.random.default_rng(base_seed + s)
+        bal = float(principal)
         all_balances[s, 0] = bal
 
-        # Build initial sampler before the year loop
-        _, init_pos_wt = get_yr_params(0)
-        sampler        = build_sampler(rng, init_pos_wt)
-        prev_in_stress = in_stress_window(0)
+        # Generate this simulation's stress calendar
+        if stoch_enabled:
+            raw   = np.array([1.0, 1.0, 1.0, 1.0, 1.0])
+            skew  = np.array([2.0, 1.5, 0.5, 0.25, 0.1]) * stoch_severity_skew
+            probs = raw + skew
+            probs = probs / probs.sum()
+            stress_cal = _generate_stress_calendar_weighted(
+                years, stoch_mean_interval, probs, rng
+            )
+        else:
+            stress_cal = None
+
+        # Build initial sampler before the year loop using year 0 params
+        yr0_severity           = get_severity_for_year(0, stress_cal)
+        yr0_rate, yr0_pos_wt   = get_stress_params(
+            base_annual_rate, pos_weight, yr0_severity > 0, yr0_severity
+        )
+        sampler        = build_sampler(rng, yr0_pos_wt)
+        prev_in_stress = yr0_severity > 0
 
         for yr in range(years):
-            age    = initial_age + yr
-            stress = in_stress_window(yr)
-            yr_rate, yr_pos_wt = get_yr_params(yr)
-            yr_monthly_rate    = yr_rate / 12
+            age         = initial_age + yr
+            yr_severity = get_severity_for_year(yr, stress_cal)
+            stress      = yr_severity > 0
+            yr_rate, yr_pos_wt = get_stress_params(
+                base_annual_rate, pos_weight, stress, yr_severity
+            )
+            yr_monthly_rate = yr_rate / 12
 
-            # Rebuild sampler only when crossing the stress boundary
+            # Rebuild sampler only when crossing a stress boundary
             if stress != prev_in_stress:
                 sampler = build_sampler(rng, yr_pos_wt)
             prev_in_stress = stress
@@ -324,6 +403,7 @@ def draw_balance_chart(ax, years_axis, all_balances, baseline,
             label='Baseline (no dither)')
 
     # Stress shading
+# Manual stress shading
     if p.get("sor_enabled"):
         s0 = p["sor_start_yr"] - 1
         s1 = s0 + p["sor_duration"]
@@ -332,6 +412,15 @@ def draw_balance_chart(ax, years_axis, all_balances, baseline,
         ax.annotate(
             f'Stress: sev {p["sor_severity"]}, {p["sor_duration"]}yr',
             xy=(s0 + 0.15, ax.get_ylim()[1] * 0.80),
+            fontsize=8, color=CORAL,
+            bbox=dict(boxstyle='round,pad=0.2', fc='white', ec=CORAL, alpha=0.75),
+        )
+
+    # Stochastic stress: just a text note — per-sim calendars can't be shown
+    elif p.get("stoch_enabled"):
+        ax.annotate(
+            f'Stochastic stress: ~every {p["stoch_mean_interval"]}yr',
+            xy=(0.02, 0.12), xycoords='axes fraction',
             fontsize=8, color=CORAL,
             bbox=dict(boxstyle='round,pad=0.2', fc='white', ec=CORAL, alpha=0.75),
         )
@@ -382,14 +471,24 @@ def draw_withdrawal_chart(ax, year_labels, all_withdrawals,
     ax.plot(year_labels, med_wd, color=PURPLE, lw=2.5, label='Median withdrawal')
 
     # Stress shading (lagged one year)
+# Manual stress shading
     if p.get("sor_enabled"):
         s0 = p["sor_start_yr"] - 1
         s1 = s0 + p["sor_duration"]
-        ax.axvspan(s0 + 1, min(s1 + 1, p["years"]),
-                   color=CORAL, alpha=0.08, label='Stress impact (lagged 1yr)')
+        ax.axvspan(s0, min(s1, p["years"]), color=CORAL, alpha=0.08,
+                   label='Stress period')
         ax.annotate(
-            f'Stress impact\n(lagged 1yr)',
-            xy=(s0 + 1.2, ax.get_ylim()[1] * 0.80),
+            f'Stress: sev {p["sor_severity"]}, {p["sor_duration"]}yr',
+            xy=(s0 + 0.15, ax.get_ylim()[1] * 0.80),
+            fontsize=8, color=CORAL,
+            bbox=dict(boxstyle='round,pad=0.2', fc='white', ec=CORAL, alpha=0.75),
+        )
+
+    # Stochastic stress: just a text note — per-sim calendars can't be shown
+    elif p.get("stoch_enabled"):
+        ax.annotate(
+            f'Stochastic stress: ~every {p["stoch_mean_interval"]}yr',
+            xy=(0.02, 0.12), xycoords='axes fraction',
             fontsize=8, color=CORAL,
             bbox=dict(boxstyle='round,pad=0.2', fc='white', ec=CORAL, alpha=0.75),
         )
@@ -715,15 +814,31 @@ with st.sidebar:
 
     st.divider()
     st.header("Sequence of Returns Stress")
-    sor_enabled = st.toggle("Enable stress period", value=False)
+
+    sor_mode = st.radio(
+        "Stress mode",
+        options=["none", "manual", "stochastic"],
+        format_func=lambda x: {
+            "none":       "None",
+            "manual":     "Manual (single event)",
+            "stochastic": "Stochastic (multiple events)"
+        }[x],
+        horizontal=True,
+    ) or "none"
+
+    sor_enabled    = (sor_mode == "manual")
+    stoch_enabled  = (sor_mode == "stochastic")
+
+    # Manual stress controls
+    st.caption("**Manual stress parameters**" if sor_enabled
+               else "*Manual parameters (inactive)*")
     sor_severity = st.slider(
         "Severity (0 = mild, 5 = severe)",
         min_value=0, max_value=5, value=2, step=1,
         disabled=not sor_enabled,
         help=(
             "Each step suppresses the base annual return by ~4 ppts "
-            "and shifts dither toward the negative mode. "
-            "Severity 5 on a 7% base → sustained −13% annual return."
+            "and shifts dither toward the negative mode."
         ),
     )
     sor_start_yr = st.slider(
@@ -736,6 +851,28 @@ with st.sidebar:
         "Duration (years)",
         min_value=1, max_value=5, value=2, step=1,
         disabled=not sor_enabled,
+    )
+
+    # Stochastic stress controls
+    st.caption("**Stochastic stress parameters**" if stoch_enabled
+               else "*Stochastic parameters (inactive)*")
+    stoch_mean_interval = st.slider(
+        "Mean years between events",
+        min_value=3, max_value=15, value=7, step=1,
+        disabled=not stoch_enabled,
+        help=(
+            "Average spacing between stress events. "
+            "Historical S&P 500 major drawdowns occur roughly every 5–8 years."
+        ),
+    )
+    stoch_severity_skew = st.slider(
+        "Severity skew (0 = uniform, 1 = mild-heavy)",
+        min_value=0.0, max_value=1.0, value=0.5, step=0.05,
+        disabled=not stoch_enabled,
+        help=(
+            "Controls how much mild events outnumber severe ones. "
+            "At 1.0, roughly 65% of events are severity 1 or 2."
+        ),
     )
 
     st.divider()
@@ -792,6 +929,9 @@ if run:
             tld_alpha        = tld_alpha,
             tld_cutoff       = tld_cutoff,
             tld_neg_weight   = tld_neg_weight,
+            stoch_enabled       = stoch_enabled,
+            stoch_mean_interval = stoch_mean_interval,
+            stoch_severity_skew = stoch_severity_skew,
         )
     st.session_state["results"] = results
     st.session_state["params"]  = dict(
@@ -816,6 +956,10 @@ if run:
         tld_alpha        = tld_alpha,
         tld_cutoff       = tld_cutoff,
         tld_neg_weight   = tld_neg_weight,
+        stoch_enabled       = stoch_enabled,
+        stoch_mean_interval = stoch_mean_interval,
+        stoch_severity_skew = stoch_severity_skew,
+        sor_mode            = sor_mode,
     )
 
 if "results" not in st.session_state:
