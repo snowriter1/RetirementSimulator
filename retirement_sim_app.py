@@ -93,6 +93,99 @@ def make_bimodal_sampler(amp, sep, sigma_frac, bias_frac, pos_wt, mom, rng):
 
     return sample
 
+def make_tld_sampler(amp, alpha, cutoff_frac, neg_weight, momentum, rng):
+    """
+    Truncated Lévy Distribution sampler.
+
+    The TLD has three regions:
+      - Central Lévy-stable-like peak (|x| < cutoff)
+      - Near-zero gap between cutoff and tail humps
+      - Separate tail humps at ±amp (negative slightly heavier)
+
+    Parameters
+    ----------
+    amp         : float – maximum dither value (%/month), hard clip boundary
+    alpha       : float – Lévy stability index (0 < alpha < 2); lower = more
+                  peaked center. Typical equity value ~1.5
+    cutoff_frac : float – fraction of amp where center distribution is clipped
+                  and tail humps begin. Typical value 0.6–0.75
+    neg_weight  : float – relative weight of negative tail hump vs positive
+                  (>0.5 means negative tail is heavier, matching real equity
+                  return asymmetry). Range 0.5–0.8
+    momentum    : float – autocorrelation of sign (regime persistence)
+    rng         : np.random.Generator
+    """
+    cutoff = cutoff_frac * amp
+    pos_tail_weight = 1.0 - neg_weight
+
+    # Tail hump centers sit just inside the amp boundary
+    tail_center_neg = -(cutoff + (amp - cutoff) * 0.6)
+    tail_center_pos =  (cutoff + (amp - cutoff) * 0.6)
+    tail_sigma      =  (amp - cutoff) * 0.25   # narrow humps
+
+    # Central Lévy-like draw via sum of scaled normals (approximation)
+    # A symmetric alpha-stable with index alpha is approximated by
+    # mixing Gaussians with Lévy-distributed variances.
+    def levy_stable_sample():
+        """Approximate symmetric alpha-stable sample, clipped to ±cutoff."""
+        v_scaled = 0.0 
+        for _ in range(50):
+            # Chambers-Mallows-Stuck method for symmetric stable
+            u = rng.uniform(-np.pi/2, np.pi/2)
+            w = rng.exponential(1.0)
+            if abs(alpha - 1.0) < 1e-6:
+                v = (2/np.pi) * ((np.pi/2 + u) * np.tan(u)
+                                 - np.log((np.pi/2 * w * np.cos(u))
+                                          / (np.pi/2 + u)))
+            else:
+                v = (np.sin(alpha * u) / np.cos(u) ** (1/alpha)
+                     * (np.cos(u - alpha * u) / w) ** ((1 - alpha) / alpha))
+            # Scale so that typical values sit within ±cutoff
+            v_scaled = v * cutoff * 0.3
+            if abs(v_scaled) <= cutoff:
+                return v_scaled
+        return float(np.clip(v_scaled, -cutoff, cutoff))
+
+    # Momentum state: +1 = tending positive, -1 = tending negative, 0 = center
+    regime = 0  # start in center
+
+    def sample():
+        nonlocal regime
+
+        # Momentum: persist in current regime or randomly switch
+        if rng.random() > momentum:
+            r = rng.random()
+            if r < 0.15:
+                regime = -1   # negative tail
+            elif r < 0.30:
+                regime = 1    # positive tail
+            else:
+                regime = 0    # center
+
+        if regime == -1:
+            # Negative tail hump
+            v = tail_center_neg
+            for _ in range(30):
+                v = rng.normal(tail_center_neg, tail_sigma)
+                if -amp <= v <= -cutoff:
+                    return v
+            return float(np.clip(v, -amp, -cutoff))
+
+        elif regime == 1:
+            # Positive tail hump
+            v = tail_center_pos
+            for _ in range(30):
+                v = rng.normal(tail_center_pos, tail_sigma)
+                if cutoff <= v <= amp:
+                    return v
+            return float(np.clip(v, cutoff, amp))
+
+        else:
+            # Central Lévy-like region
+            return levy_stable_sample()
+
+    return sample
+
 # ══════════════════════════════════════════════════════════════════════════════
 # Stress helper
 # ══════════════════════════════════════════════════════════════════════════════
@@ -118,6 +211,8 @@ def run_simulation(
     amplitude, peak_sep, peak_sigma, bias, pos_weight, momentum,
     n_sims, base_seed, initial_age,
     sor_enabled=False, sor_severity=2, sor_start_yr=1, sor_duration=2,
+    dither_model='bimodal',
+    tld_alpha=1.5, tld_cutoff=0.65, tld_neg_weight=0.65,
 ):
     base_monthly_rate = base_annual_rate / 12
 
@@ -125,15 +220,34 @@ def run_simulation(
         return (sor_enabled
                 and sor_start_yr - 1 <= yr < sor_start_yr - 1 + sor_duration)
 
-    # ── Baseline: no dither, RMD applied, stress applied ─────────────────────
-    baseline = np.empty(years + 1)
-    baseline[0] = principal
-    bal = float(principal)
-    for yr in range(years):
-        age = initial_age + yr
-        yr_rate, _ = get_stress_params(
-            base_annual_rate, pos_weight, in_stress_window(yr), sor_severity
+    def get_yr_params(yr):
+        """Returns (annual_rate, effective_pos_weight) for a given year."""
+        return get_stress_params(
+            base_annual_rate, pos_weight,
+            in_stress_window(yr), sor_severity
         )
+
+    def build_sampler(rng, yr_pos_wt):
+        """Constructs the appropriate sampler for the current regime."""
+        if dither_model == 'tld':
+            return make_tld_sampler(
+                amplitude, tld_alpha, tld_cutoff,
+                tld_neg_weight, momentum, rng
+            )
+        else:
+            return make_bimodal_sampler(
+                amplitude, peak_sep, peak_sigma, bias,
+                yr_pos_wt, momentum, rng
+            )
+
+    # ── Baseline: no dither, RMD applied, stress applied ─────────────────────
+    baseline    = np.empty(years + 1)
+    baseline[0] = principal
+    bal         = float(principal)
+
+    for yr in range(years):
+        age              = initial_age + yr
+        yr_rate, _       = get_yr_params(yr)
         monthly_rate     = yr_rate / 12
         rmd_annual       = get_rmd(bal, age)
         voluntary_annual = bal * withdrawal_rate
@@ -149,35 +263,30 @@ def run_simulation(
     rmd_binding     = np.zeros((n_sims, years), dtype=bool)
 
     for s in range(n_sims):
-        rng = np.random.default_rng(base_seed + s)
-        bal = float(principal)
+        rng            = np.random.default_rng(base_seed + s)
+        bal            = float(principal)
         all_balances[s, 0] = bal
-        sampler = make_bimodal_sampler(
-                    amplitude, peak_sep, peak_sigma, bias,
-                    pos_weight, momentum, rng
-                )
-        prev_in_stress = False
+
+        # Build initial sampler before the year loop
+        _, init_pos_wt = get_yr_params(0)
+        sampler        = build_sampler(rng, init_pos_wt)
+        prev_in_stress = in_stress_window(0)
 
         for yr in range(years):
             age    = initial_age + yr
             stress = in_stress_window(yr)
-            yr_rate, yr_pos_wt = get_stress_params(
-                base_annual_rate, pos_weight, stress, sor_severity
-            )
-            yr_monthly_rate = yr_rate / 12
+            yr_rate, yr_pos_wt = get_yr_params(yr)
+            yr_monthly_rate    = yr_rate / 12
 
-            # Rebuild sampler only when stress boundary is crossed
+            # Rebuild sampler only when crossing the stress boundary
             if stress != prev_in_stress:
-                sampler = make_bimodal_sampler(
-                    amplitude, peak_sep, peak_sigma, bias,
-                    yr_pos_wt, momentum, rng
-                )
+                sampler = build_sampler(rng, yr_pos_wt)
             prev_in_stress = stress
 
-            rmd_annual       = get_rmd(bal, age)
-            voluntary_annual = bal * withdrawal_rate
+            rmd_annual         = get_rmd(bal, age)
+            voluntary_annual   = bal * withdrawal_rate
             rmd_binding[s, yr] = rmd_annual > voluntary_annual
-            monthly_wd       = max(voluntary_annual, rmd_annual) / 12
+            monthly_wd         = max(voluntary_annual, rmd_annual) / 12
 
             year_withdrawn = 0.0
             for _ in range(12):
@@ -309,25 +418,47 @@ def draw_withdrawal_chart(ax, year_labels, all_withdrawals,
     ax.grid(axis='y', color=LGRAY, alpha=0.35, lw=0.5)
 
 
-def draw_dither_pdf(ax, amplitude, peak_sep, peak_sigma, bias, pos_weight):
-    x      = np.linspace(-amplitude * 1.1, amplitude * 1.1, 500)
-    mu_pos =  peak_sep * amplitude + bias * amplitude
-    mu_neg = -peak_sep * amplitude + bias * amplitude
-    sigma  =  peak_sigma * amplitude
+def draw_dither_pdf(ax, amplitude, peak_sep, peak_sigma, bias, pos_weight,
+                    dither_model='bimodal',
+                    tld_alpha=1.5, tld_cutoff=0.65, tld_neg_weight=0.65):
+    x = np.linspace(-amplitude * 1.1, amplitude * 1.1, 500)
 
-    pdf_pos = pos_weight       * sp_norm.pdf(x, mu_pos, sigma)
-    pdf_neg = (1 - pos_weight) * sp_norm.pdf(x, mu_neg, sigma)
-    pdf_tot = pdf_pos + pdf_neg
+    if dither_model == 'bimodal':
+        mu_pos =  peak_sep * amplitude + bias * amplitude
+        mu_neg = -peak_sep * amplitude + bias * amplitude
+        sigma  =  peak_sigma * amplitude
 
-    ax.fill_between(x, pdf_tot, alpha=0.22, color=PURPLE)
-    ax.plot(x, pdf_tot, color=PURPLE, lw=2.0, label='Total PDF')
-    ax.plot(x, pdf_pos, color=BLUE,   lw=1.3, ls='--', alpha=0.8,
-            label=f'Pos mode (w={pos_weight:.2f}, μ={mu_pos:+.3f}%)')
-    ax.plot(x, pdf_neg, color=CORAL,  lw=1.3, ls='--', alpha=0.8,
-            label=f'Neg mode (w={1-pos_weight:.2f}, μ={mu_neg:+.3f}%)')
-    ax.axvline(0,                color=LGRAY,   lw=0.8, ls=':')
-    ax.axvline(bias * amplitude, color='black', lw=1.2, ls='-', alpha=0.6,
-               label=f'Bias ({bias*amplitude:+.3f}%)')
+        pdf_pos = pos_weight       * sp_norm.pdf(x, mu_pos, sigma)
+        pdf_neg = (1 - pos_weight) * sp_norm.pdf(x, mu_neg, sigma)
+        pdf_tot = pdf_pos + pdf_neg
+
+        ax.fill_between(x, pdf_tot, alpha=0.22, color=PURPLE)
+        ax.plot(x, pdf_tot, color=PURPLE, lw=2.0, label='Total PDF')
+        ax.plot(x, pdf_pos, color=BLUE,   lw=1.3, ls='--', alpha=0.8,
+                label=f'Pos mode (w={pos_weight:.2f}, μ={mu_pos:+.3f}%)')
+        ax.plot(x, pdf_neg, color=CORAL,  lw=1.3, ls='--', alpha=0.8,
+                label=f'Neg mode (w={1-pos_weight:.2f}, μ={mu_neg:+.3f}%)')
+        ax.axvline(0,                color=LGRAY,   lw=0.8, ls=':')
+        ax.axvline(bias * amplitude, color='black', lw=1.2, ls='-', alpha=0.6,
+                   label=f'Bias ({bias*amplitude:+.3f}%)')
+
+    else:  # TLD
+        pdf_tot, pdf_ctr, pdf_neg_tail, pdf_pos_tail = tld_pdf_components(
+            x, amplitude, tld_alpha, tld_cutoff, tld_neg_weight
+        )
+        cutoff = tld_cutoff * amplitude
+        ax.fill_between(x, pdf_tot, alpha=0.22, color=PURPLE)
+        ax.plot(x, pdf_tot,      color=PURPLE, lw=2.0, label='Total PDF')
+        ax.plot(x, pdf_ctr,      color=BLUE,   lw=1.3, ls='--', alpha=0.8,
+                label=f'Center (α={tld_alpha:.2f})')
+        ax.plot(x, pdf_neg_tail, color=CORAL,  lw=1.3, ls='--', alpha=0.8,
+                label=f'Neg tail (w={tld_neg_weight:.2f})')
+        ax.plot(x, pdf_pos_tail, color=GREEN,  lw=1.3, ls='--', alpha=0.8,
+                label=f'Pos tail (w={1-tld_neg_weight:.2f})')
+        ax.axvline( cutoff, color=LGRAY, lw=0.8, ls=':', alpha=0.7)
+        ax.axvline(-cutoff, color=LGRAY, lw=0.8, ls=':', alpha=0.7,
+                   label=f'Cutoff (±{cutoff:.3f}%)')
+        
     ax.set_xlim(-amplitude * 1.1, amplitude * 1.1)
     ax.set_ylim(bottom=0)
     ax.set_xlabel('Monthly rate dither (%/month)', fontsize=9)
@@ -336,6 +467,50 @@ def draw_dither_pdf(ax, amplitude, peak_sep, peak_sigma, bias, pos_weight):
     ax.legend(fontsize=8, loc='upper right')
     ax.grid(axis='y', color=LGRAY, alpha=0.4, lw=0.5)
 
+def tld_pdf_components(x, amp, alpha, cutoff_frac, neg_weight):
+    """Returns total PDF array for TLD for display purposes."""
+    cutoff = cutoff_frac * amp
+    pos_tail_weight = 1.0 - neg_weight
+
+    tail_center_neg = -(cutoff + (amp - cutoff) * 0.6)
+    tail_center_pos =  (cutoff + (amp - cutoff) * 0.6)
+    tail_sigma      =  (amp - cutoff) * 0.25
+
+    # Central: approximate Lévy stable PDF via scipy
+    from scipy.stats import levy_stable
+    # Scale so central mass fits within ±cutoff
+    scale = cutoff * 0.3 / 2.0
+    pdf_center = levy_stable.pdf(x, alpha=alpha, beta=0, scale=scale, loc=0)
+    pdf_center = np.asarray(pdf_center, dtype=float)
+    # Zero out outside ±cutoff (the truncation)
+    pdf_center = np.where(np.abs(x) <= cutoff, pdf_center, 0.0)
+
+    # Tail humps
+    pdf_neg_tail = neg_weight       * sp_norm.pdf(x, tail_center_neg, tail_sigma)
+    pdf_pos_tail = pos_tail_weight  * sp_norm.pdf(x, tail_center_pos, tail_sigma)
+    # Zero out tails inside cutoff
+    pdf_neg_tail = np.where(x <= -cutoff, pdf_neg_tail, 0.0)
+    pdf_pos_tail = np.where(x >=  cutoff, pdf_pos_tail, 0.0)
+
+    # Normalize each component so the total is a proper display PDF
+    dx = x[1] - x[0]
+    center_mass   = pdf_center.sum()   * dx
+    neg_tail_mass = pdf_neg_tail.sum() * dx
+    pos_tail_mass = pdf_pos_tail.sum() * dx
+    total_mass    = center_mass + neg_tail_mass + pos_tail_mass
+
+    center_frac   = 0.70   # 70% of probability in center, 30% in tails
+    tail_frac     = 1.0 - center_frac
+
+    if center_mass > 0:
+        pdf_center   = pdf_center   * (center_frac  / center_mass  * dx)
+    if neg_tail_mass > 0:
+        pdf_neg_tail = pdf_neg_tail * (tail_frac * neg_weight      / neg_tail_mass * dx)
+    if pos_tail_mass > 0:
+        pdf_pos_tail = pdf_pos_tail * (tail_frac * pos_tail_weight / pos_tail_mass * dx)
+
+    pdf_total = pdf_center + pdf_neg_tail + pdf_pos_tail
+    return pdf_total, pdf_center, pdf_neg_tail, pdf_pos_tail
 
 def draw_param_table(ax, p, med_bal, p5_bal, p95_bal, depleted, first_dep_yr):
     ax.axis('off')
@@ -402,8 +577,12 @@ def build_export_figure(years_axis, year_labels,
     draw_withdrawal_chart(ax_wd, year_labels, all_withdrawals,
                           med_wd, p5_wd, p95_wd, p, rmd_first_yr)
     draw_dither_pdf(ax_pdf,
-                    p["amplitude"], p["peak_sep"], p["peak_sigma"],
-                    p["bias"], p["pos_weight"])
+                p["amplitude"], p["peak_sep"], p["peak_sigma"],
+                p["bias"], p["pos_weight"],
+                dither_model=p.get("dither_model") or  "bimodal",
+                tld_alpha=p.get("tld_alpha", 1.5),
+                tld_cutoff=p.get("tld_cutoff", 0.65),
+                tld_neg_weight=p.get("tld_neg_weight", 0.65))
     draw_param_table(ax_info, p, med_bal, p5_bal, p95_bal,
                      depleted, first_dep_yr)
 
@@ -466,36 +645,72 @@ with st.sidebar:
 
     st.divider()
     st.header("Monthly Rate Dither")
-    st.caption("Bimodal Gaussian noise added to the monthly return rate.")
+    st.caption("Noise added to the monthly return rate.")
+
+    dither_model = st.radio(
+        "Dither model",
+        options=["bimodal", "tld"],
+        format_func=lambda x: "Bimodal Gaussian" if x == "bimodal" else "Truncated Lévy (TLD)",
+        horizontal=True,
+    ) or "bimodal"
 
     amplitude = st.slider(
         "Max amplitude ±(%/month)",
-        min_value=0.1, max_value=2.0, value=1.4, step=0.05,
+        min_value=0.1, max_value=1.5, value=0.75, step=0.05,
     )
+    momentum = st.slider(
+        "Momentum (mode autocorrelation)",
+        min_value=0.00, max_value=0.95, value=0.65, step=0.05,
+        help="Probability of staying in the current regime each month.",
+    )
+
+    # Bimodal-specific controls
+    bimodal_disabled = (dither_model == "tld")
+    st.caption("**Bimodal Gaussian parameters**" if not bimodal_disabled
+               else "*Bimodal parameters (inactive)*")
     peak_sep = st.slider(
         "Peak separation (fraction of amplitude)",
-        min_value=0.05, max_value=0.95, value=0.40, step=0.05,
+        min_value=0.05, max_value=0.95, value=0.50, step=0.05,
+        disabled=bimodal_disabled,
         help="Moves the two Gaussian peaks symmetrically away from zero.",
     )
     peak_sigma = st.slider(
         "Peak width σ (fraction of amplitude)",
-        min_value=0.05, max_value=0.60, value=0.5, step=0.025,
-        help="Std-dev of each Gaussian. Wider = more overlap between modes.",
+        min_value=0.05, max_value=0.60, value=0.25, step=0.025,
+        disabled=bimodal_disabled,
     )
     bias = st.slider(
         "Bias — median shift (fraction of amplitude)",
-        min_value=-0.50, max_value=0.50, value=0.12, step=0.025,
-        help="Shifts both peaks left (bearish) or right (bullish).",
+        min_value=-0.50, max_value=0.50, value=0.00, step=0.025,
+        disabled=bimodal_disabled,
     )
     pos_weight = st.slider(
         "Positive mode weight",
-        min_value=0.10, max_value=0.90, value=0.58, step=0.05,
-        help="Mixing weight of the positive Gaussian (0.5 = symmetric).",
+        min_value=0.10, max_value=0.90, value=0.50, step=0.05,
+        disabled=bimodal_disabled,
     )
-    momentum = st.slider(
-        "Momentum (mode autocorrelation)",
-        min_value=0.00, max_value=0.95, value=0.75, step=0.05,
-        help="Probability of staying in the current mode each month.",
+
+    # TLD-specific controls
+    tld_disabled = (dither_model == "bimodal")
+    st.caption("**Truncated Lévy parameters**" if not tld_disabled
+               else "*TLD parameters (inactive)*")
+    tld_alpha = st.slider(
+        "Lévy stability index α",
+        min_value=0.5, max_value=1.99, value=1.5, step=0.05,
+        disabled=tld_disabled,
+        help="Lower = more peaked center and heavier tails. Typical equity ~1.5",
+    )
+    tld_cutoff = st.slider(
+        "Cutoff (fraction of amplitude)",
+        min_value=0.30, max_value=0.85, value=0.65, step=0.05,
+        disabled=tld_disabled,
+        help="Where the central distribution ends and the gap begins.",
+    )
+    tld_neg_weight = st.slider(
+        "Negative tail weight",
+        min_value=0.50, max_value=0.90, value=0.65, step=0.05,
+        disabled=tld_disabled,
+        help="Relative weight of negative vs positive tail hump. >0.5 = heavier negative tail.",
     )
 
     st.divider()
@@ -540,7 +755,11 @@ st.subheader("Dither Distribution Preview")
 st.caption("Updates live as you adjust dither controls. Click ▶ Run Simulation to update portfolio charts.")
 
 fig_pdf, ax_pdf_prev = plt.subplots(figsize=(7, 2.6))
-draw_dither_pdf(ax_pdf_prev, amplitude, peak_sep, peak_sigma, bias, pos_weight)
+draw_dither_pdf(ax_pdf_prev, amplitude, peak_sep, peak_sigma, bias, pos_weight,
+                dither_model=dither_model or "bimodal",
+                tld_alpha=tld_alpha,
+                tld_cutoff=tld_cutoff,
+                tld_neg_weight=tld_neg_weight)
 fig_pdf.tight_layout()
 st.pyplot(fig_pdf, use_container_width=True)
 plt.close(fig_pdf)
@@ -569,6 +788,10 @@ if run:
             sor_severity     = sor_severity,
             sor_start_yr     = sor_start_yr,
             sor_duration     = sor_duration,
+            dither_model     = dither_model,
+            tld_alpha        = tld_alpha,
+            tld_cutoff       = tld_cutoff,
+            tld_neg_weight   = tld_neg_weight,
         )
     st.session_state["results"] = results
     st.session_state["params"]  = dict(
@@ -589,6 +812,10 @@ if run:
         sor_severity     = sor_severity,
         sor_start_yr     = sor_start_yr,
         sor_duration     = sor_duration,
+        dither_model     = dither_model,
+        tld_alpha        = tld_alpha,
+        tld_cutoff       = tld_cutoff,
+        tld_neg_weight   = tld_neg_weight,
     )
 
 if "results" not in st.session_state:
