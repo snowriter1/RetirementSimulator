@@ -122,6 +122,14 @@ def make_tld_sampler(amp, alpha, cutoff_frac, neg_weight, momentum, rng):
     tail_center_neg = -(cutoff + (amp - cutoff) * 0.6)
     tail_center_pos =  (cutoff + (amp - cutoff) * 0.6)
     tail_sigma      =  (amp - cutoff) * 0.25   # narrow humps
+    # Compute theoretical mean of the dither distribution so we can
+    # mean-correct each sample — ensures base rate slider is exact
+    center_frac  = 0.70
+    tail_frac    = 1.0 - center_frac
+    # Central Lévy-stable is symmetric so its mean contribution is 0
+    mean_neg_tail = tail_frac * neg_weight       * tail_center_neg
+    mean_pos_tail = tail_frac * pos_tail_weight  * tail_center_pos
+    dither_mean   = mean_neg_tail + mean_pos_tail   # negative number
 
     # Central Lévy-like draw via sum of scaled normals (approximation)
     # A symmetric alpha-stable with index alpha is approximated by
@@ -168,8 +176,8 @@ def make_tld_sampler(amp, alpha, cutoff_frac, neg_weight, momentum, rng):
             for _ in range(30):
                 v = rng.normal(tail_center_neg, tail_sigma)
                 if -amp <= v <= -cutoff:
-                    return v
-            return float(np.clip(v, -amp, -cutoff))
+                    return float(np.clip(v - dither_mean, -amp, amp))
+            return float(np.clip(v - dither_mean, -amp, amp))
 
         elif regime == 1:
             # Positive tail hump
@@ -177,14 +185,15 @@ def make_tld_sampler(amp, alpha, cutoff_frac, neg_weight, momentum, rng):
             for _ in range(30):
                 v = rng.normal(tail_center_pos, tail_sigma)
                 if cutoff <= v <= amp:
-                    return v
-            return float(np.clip(v, cutoff, amp))
+                    return float(np.clip(v - dither_mean, -amp, amp))
+            return float(np.clip(v - dither_mean, -amp, amp))
 
         else:
             # Central Lévy-like region
-            return levy_stable_sample()
+            raw = levy_stable_sample()
+            return float(np.clip(raw - dither_mean, -amp, amp))
 
-    return sample
+    return sample   # ← returns the function, not a value
 
 # ══════════════════════════════════════════════════════════════════════════════
 # Stress helper
