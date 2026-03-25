@@ -264,7 +264,7 @@ def run_simulation(
     amplitude, peak_sep, peak_sigma, bias, pos_weight, momentum,
     n_sims, base_seed, initial_age,
     sor_enabled=False, sor_severity=2, sor_start_yr=1, sor_duration=2,
-    dither_model='bimodal',
+    dither_model='tld',
     tld_alpha=1.5, tld_cutoff=0.65, tld_neg_weight=0.65,
     stoch_enabled=False,                  # ← new
     stoch_mean_interval=7,                # ← new
@@ -527,7 +527,7 @@ def draw_withdrawal_chart(ax, year_labels, all_withdrawals,
 
 
 def draw_dither_pdf(ax, amplitude, peak_sep, peak_sigma, bias, pos_weight,
-                    dither_model='bimodal',
+                    dither_model='tld',
                     tld_alpha=1.5, tld_cutoff=0.65, tld_neg_weight=0.65):
     x = np.linspace(-amplitude * 1.1, amplitude * 1.1, 500)
 
@@ -687,7 +687,7 @@ def build_export_figure(years_axis, year_labels,
     draw_dither_pdf(ax_pdf,
                 p["amplitude"], p["peak_sep"], p["peak_sigma"],
                 p["bias"], p["pos_weight"],
-                dither_model=p.get("dither_model") or  "bimodal",
+                dither_model=p.get("dither_model") or  "tld",
                 tld_alpha=p.get("tld_alpha", 1.5),
                 tld_cutoff=p.get("tld_cutoff", 0.65),
                 tld_neg_weight=p.get("tld_neg_weight", 0.65))
@@ -728,7 +728,7 @@ with st.sidebar:
     )
     base_rate_pct = st.slider(
         "Base annual return rate (%)",
-        min_value=1.0, max_value=20.0, value=5.0, step=0.5,
+        min_value=1.0, max_value=20.0, value=7.0, step=0.5,
     )
     withdrawal_pct = st.slider(
         "Annual withdrawal rate (% of current balance)",
@@ -757,10 +757,10 @@ with st.sidebar:
 
     dither_model = st.radio(
         "Dither model",
-        options=["bimodal", "tld"],
+        options=["tld", "bimodal"],
         format_func=lambda x: "Bimodal Gaussian" if x == "bimodal" else "Truncated Lévy (TLD)",
         horizontal=True,
-    ) or "bimodal"
+    ) or "tld"
 
     amplitude = st.slider(
         "Max amplitude ±(%/month)",
@@ -902,7 +902,7 @@ st.caption("Updates live as you adjust dither controls. Click ▶ Run Simulation
 
 fig_pdf, ax_pdf_prev = plt.subplots(figsize=(7, 2.6))
 draw_dither_pdf(ax_pdf_prev, amplitude, peak_sep, peak_sigma, bias, pos_weight,
-                dither_model=dither_model or "bimodal",
+                dither_model=dither_model or "tld",
                 tld_alpha=tld_alpha,
                 tld_cutoff=tld_cutoff,
                 tld_neg_weight=tld_neg_weight)
