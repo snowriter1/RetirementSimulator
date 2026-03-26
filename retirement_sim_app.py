@@ -571,7 +571,7 @@ def draw_dither_pdf(ax, amplitude, peak_sep, peak_sigma, bias, pos_weight,
     ax.set_ylim(bottom=0)
     ax.set_xlabel('Monthly rate dither (%/month)', fontsize=9)
     ax.set_ylabel('Density', fontsize=9)
-    ax.set_title('Bimodal dither distribution', fontsize=10, fontweight='bold')
+    ax.set_title('Dither Distribution', fontsize=10, fontweight='bold')
     ax.legend(fontsize=8, loc='upper right')
     ax.grid(axis='y', color=LGRAY, alpha=0.4, lw=0.5)
 
